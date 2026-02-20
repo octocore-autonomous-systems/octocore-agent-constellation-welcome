@@ -2,123 +2,178 @@
 #
 # setup-hub-tunnel.sh - Set up reverse SSH tunnel to Octocore Constellation Hub
 #
-# This script configures a persistent reverse SSH tunnel from a spoke (agent)
-# to the hub (bot.ericmilgram.com), enabling:
-# - Inbound SSH access to the spoke from the hub
-# - Inbound gateway access for webhooks
+# Goals:
+# - One-command, idempotent installation of a systemd *user* service on a spoke
+# - Reverse SSH tunnel (hub can reach spoke SSH)
+# - Reverse gateway tunnel (hub can reach spoke gateway for webhooks)
 #
-# Usage: ./setup-hub-tunnel.sh [--install-systemd|--install-runit]
+# Source of truth for port assignments: Constellation Bible.
+#
+# Typical usage (Deadpool):
+#   ./scripts/setup-hub-tunnel.sh --agent deadpool --install-systemd --enable-now
 #
 
 set -euo pipefail
 
-# ============================================================================
-# CONFIGURATION - Edit these for your agent
-# ============================================================================
+say() { printf "%s\n" "$*"; }
+die() { printf "ERROR: %s\n" "$*" >&2; exit 2; }
 
-# Hub connection
-HUB_HOST="${HUB_HOST:-bot.ericmilgram.com}"
-HUB_USER="${HUB_USER:-eric_octocore_ai}"
+# ---------------------------------------------------------------------------
+# Defaults (can be overridden by flags)
+# ---------------------------------------------------------------------------
+HUB_HOST="bot.ericmilgram.com"
+HUB_USER="eric_octocore_ai"
 
-# Your agent's local ports
-LOCAL_SSH_PORT="${LOCAL_SSH_PORT:-22}"           # Your local SSH port (22 for Linux, 8022 for Termux)
-LOCAL_GATEWAY_PORT="${LOCAL_GATEWAY_PORT:-18789}" # Your OpenClaw gateway port
+LOCAL_SSH_PORT=22
+LOCAL_GATEWAY_PORT=18789
 
-# Hub-side ports (assigned by hub admin - check the Constellation Bible)
-# Port assignments by agent:
-#   Envy (Data):    SSH=2222, Gateway=18790
-#   JARVIS:         SSH=2223, Gateway=28791
-#   Deadpool (Indy): SSH=2224, Gateway=18793
-REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-}"
-REMOTE_GATEWAY_PORT="${REMOTE_GATEWAY_PORT:-}"
+REMOTE_SSH_PORT=""
+REMOTE_GATEWAY_PORT=""
+AGENT_NAME=""
 
-# SSH options for reliability
-SSH_OPTS="-o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes"
+ACTION="run"          # run|install-systemd|status
+ENABLE_NOW=0
 
-# ============================================================================
-# VALIDATION
-# ============================================================================
+SSH_OPTS=(
+  -o ServerAliveInterval=30
+  -o ServerAliveCountMax=3
+  -o ExitOnForwardFailure=yes
+  -o BatchMode=yes
+)
 
-validate_config() {
-    local errors=0
-    
-    if [[ -z "$REMOTE_SSH_PORT" ]]; then
-        echo "ERROR: REMOTE_SSH_PORT not set."
-        errors=$((errors + 1))
-    fi
-    
-    if [[ -z "$REMOTE_GATEWAY_PORT" ]]; then
-        echo "ERROR: REMOTE_GATEWAY_PORT not set."
-        errors=$((errors + 1))
-    fi
-    
-    if [[ $errors -gt 0 ]]; then
-        echo ""
-        echo "These ports are assigned by the hub admin. Check the Constellation Bible."
-        echo ""
-        echo "Example for Deadpool:"
-        echo "  export REMOTE_SSH_PORT=2224"
-        echo "  export REMOTE_GATEWAY_PORT=18793"
-        echo "  $0"
-        echo ""
-        echo "Or pass them inline:"
-        echo "  REMOTE_SSH_PORT=2224 REMOTE_GATEWAY_PORT=18793 $0"
-        exit 1
-    fi
-    
-    # Check if local SSH is accessible
+# ---------------------------------------------------------------------------
+# Agent presets (update only in accordance with the Constellation Bible)
+# ---------------------------------------------------------------------------
+apply_agent_preset() {
+  case "$1" in
+    envy|data)
+      REMOTE_SSH_PORT=2222
+      REMOTE_GATEWAY_PORT=18790
+      ;;
+    jarvis|phone)
+      REMOTE_SSH_PORT=2223
+      REMOTE_GATEWAY_PORT=28791
+      # If running on Termux, local ssh is often 8022. Caller may override.
+      ;;
+    deadpool|indy)
+      REMOTE_SSH_PORT=2224
+      REMOTE_GATEWAY_PORT=18793
+      ;;
+    *)
+      die "unknown agent preset: $1 (expected: deadpool|jarvis|envy)"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+show_help() {
+  cat <<HELP
+USAGE:
+  setup-hub-tunnel.sh --agent deadpool --install-systemd --enable-now
+  setup-hub-tunnel.sh --agent deadpool            # run tunnel in foreground
+
+OPTIONS:
+  --agent <deadpool|jarvis|envy>      Apply Constellation Bible port preset
+  --hub-host <host>                   Default: bot.ericmilgram.com
+  --hub-user <user>                   Default: eric_octocore_ai
+
+  --local-ssh-port <port>             Default: 22
+  --local-gateway-port <port>         Default: 18789
+
+  --remote-ssh-port <port>            Override hub listener port (ssh)
+  --remote-gateway-port <port>        Override hub listener port (gateway)
+
+  --install-systemd                   Write/update systemd *user* service file
+  --enable-now                        When installing, also daemon-reload + enable --now
+  --status                            Basic checks
+  -h, --help                          Help
+
+NOTES:
+- This script avoids requiring env vars; pass flags instead.
+- Systemd unit will restart the tunnel if it drops.
+HELP
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent)
+      AGENT_NAME="${2:-}"; [[ -n "$AGENT_NAME" ]] || die "--agent requires a value"; apply_agent_preset "$AGENT_NAME"; shift 2 ;;
+    --hub-host)
+      HUB_HOST="${2:-}"; [[ -n "$HUB_HOST" ]] || die "--hub-host requires a value"; shift 2 ;;
+    --hub-user)
+      HUB_USER="${2:-}"; [[ -n "$HUB_USER" ]] || die "--hub-user requires a value"; shift 2 ;;
+
+    --local-ssh-port)
+      LOCAL_SSH_PORT="${2:-}"; shift 2 ;;
+    --local-gateway-port)
+      LOCAL_GATEWAY_PORT="${2:-}"; shift 2 ;;
+
+    --remote-ssh-port)
+      REMOTE_SSH_PORT="${2:-}"; shift 2 ;;
+    --remote-gateway-port)
+      REMOTE_GATEWAY_PORT="${2:-}"; shift 2 ;;
+
+    --install-systemd)
+      ACTION="install-systemd"; shift ;;
+    --enable-now)
+      ENABLE_NOW=1; shift ;;
+    --status)
+      ACTION="status"; shift ;;
+
+    -h|--help)
+      show_help; exit 0 ;;
+    *)
+      die "unknown arg: $1" ;;
+  esac
+done
+
+validate() {
+  [[ -n "$REMOTE_SSH_PORT" ]] || die "REMOTE_SSH_PORT unset (use --agent or --remote-ssh-port)"
+  [[ -n "$REMOTE_GATEWAY_PORT" ]] || die "REMOTE_GATEWAY_PORT unset (use --agent or --remote-gateway-port)"
+}
+
+start_tunnel_fg() {
+  validate
+
+  say "=============================================="
+  say "Starting reverse SSH tunnel to Constellation Hub"
+  say "=============================================="
+  say "Hub:      ${HUB_USER}@${HUB_HOST}"
+  say "SSH:      localhost:${LOCAL_SSH_PORT} -> hub:${REMOTE_SSH_PORT}"
+  say "Gateway:  localhost:${LOCAL_GATEWAY_PORT} -> hub:${REMOTE_GATEWAY_PORT}"
+  say ""
+
+  # Warn only; do not fail.
+  if command -v nc >/dev/null 2>&1; then
     if ! nc -z 127.0.0.1 "$LOCAL_SSH_PORT" 2>/dev/null; then
-        echo "WARNING: Local SSH port $LOCAL_SSH_PORT does not appear to be listening."
-        echo "         Make sure sshd is running before the hub tries to connect."
+      say "WARNING: Local SSH port ${LOCAL_SSH_PORT} is not listening (is sshd running?)"
     fi
-    
-    # Check if local gateway is accessible
     if ! nc -z 127.0.0.1 "$LOCAL_GATEWAY_PORT" 2>/dev/null; then
-        echo "WARNING: Local gateway port $LOCAL_GATEWAY_PORT does not appear to be listening."
-        echo "         Make sure OpenClaw/Clawdbot gateway is running."
+      say "WARNING: Local gateway port ${LOCAL_GATEWAY_PORT} is not listening (start gateway later)"
     fi
+  fi
+
+  exec ssh -N \
+    -R "127.0.0.1:${REMOTE_SSH_PORT}:127.0.0.1:${LOCAL_SSH_PORT}" \
+    -R "127.0.0.1:${REMOTE_GATEWAY_PORT}:127.0.0.1:${LOCAL_GATEWAY_PORT}" \
+    "${SSH_OPTS[@]}" \
+    "${HUB_USER}@${HUB_HOST}"
 }
 
-# ============================================================================
-# FUNCTIONS
-# ============================================================================
+install_systemd_user_service() {
+  validate
 
-start_tunnel() {
-    echo "=============================================="
-    echo "Starting reverse SSH tunnel to Constellation Hub"
-    echo "=============================================="
-    echo ""
-    echo "Hub:      ${HUB_USER}@${HUB_HOST}"
-    echo "SSH:      localhost:${LOCAL_SSH_PORT} -> hub:${REMOTE_SSH_PORT}"
-    echo "Gateway:  localhost:${LOCAL_GATEWAY_PORT} -> hub:${REMOTE_GATEWAY_PORT}"
-    echo ""
-    echo "Press Ctrl+C to stop the tunnel."
-    echo ""
-    
-    ssh -N \
-        -R "127.0.0.1:${REMOTE_SSH_PORT}:127.0.0.1:${LOCAL_SSH_PORT}" \
-        -R "127.0.0.1:${REMOTE_GATEWAY_PORT}:127.0.0.1:${LOCAL_GATEWAY_PORT}" \
-        ${SSH_OPTS} \
-        "${HUB_USER}@${HUB_HOST}"
-}
+  local service_name="constellation-hub-tunnel"
+  local service_dir="$HOME/.config/systemd/user"
+  local service_file="${service_dir}/${service_name}.service"
+  local script_path
+  script_path="$(realpath "$0")"
 
-install_systemd_service() {
-    local service_name="constellation-hub-tunnel"
-    local service_dir="$HOME/.config/systemd/user"
-    local service_file="${service_dir}/${service_name}.service"
-    local script_path
-    script_path="$(realpath "$0")"
-    
-    # Idempotent: create directory if needed
-    mkdir -p "$service_dir"
-    
-    # Check if service already exists
-    if [[ -f "$service_file" ]]; then
-        echo "Service file already exists: $service_file"
-        echo "Updating with current configuration..."
-    fi
-    
-    cat > "$service_file" << SERVICEEOF
+  mkdir -p "$service_dir"
+
+  cat > "$service_file" <<SERVICEEOF
 [Unit]
 Description=Octocore Constellation Hub Tunnel
 After=network-online.target
@@ -126,13 +181,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment="HUB_HOST=${HUB_HOST}"
-Environment="HUB_USER=${HUB_USER}"
-Environment="REMOTE_SSH_PORT=${REMOTE_SSH_PORT}"
-Environment="REMOTE_GATEWAY_PORT=${REMOTE_GATEWAY_PORT}"
-Environment="LOCAL_SSH_PORT=${LOCAL_SSH_PORT}"
-Environment="LOCAL_GATEWAY_PORT=${LOCAL_GATEWAY_PORT}"
-ExecStart=${script_path}
+ExecStart=${script_path} \
+  --hub-host ${HUB_HOST} \
+  --hub-user ${HUB_USER} \
+  --local-ssh-port ${LOCAL_SSH_PORT} \
+  --local-gateway-port ${LOCAL_GATEWAY_PORT} \
+  --remote-ssh-port ${REMOTE_SSH_PORT} \
+  --remote-gateway-port ${REMOTE_GATEWAY_PORT}
 Restart=always
 RestartSec=5
 
@@ -140,146 +195,38 @@ RestartSec=5
 WantedBy=default.target
 SERVICEEOF
 
-    echo "Created/updated systemd user service: $service_file"
-    echo ""
-    echo "To enable and start:"
-    echo "  systemctl --user daemon-reload"
-    echo "  systemctl --user enable --now ${service_name}"
-    echo ""
-    echo "To check status:"
-    echo "  systemctl --user status ${service_name}"
-    echo ""
-    echo "To view logs:"
-    echo "  journalctl --user -u ${service_name} -f"
+  say "Wrote systemd user service: ${service_file}"
+
+  if [[ "$ENABLE_NOW" -eq 1 ]]; then
+    systemctl --user daemon-reload
+    systemctl --user enable --now "${service_name}"
+    say "Enabled+started: ${service_name}"
+    systemctl --user --no-pager status "${service_name}" || true
+  else
+    say "Next: systemctl --user daemon-reload && systemctl --user enable --now ${service_name}"
+  fi
 }
 
-install_runit_service() {
-    # For Termux or other runit-based systems
-    local service_name="hub-tunnel"
-    local service_dir
-    local script_path
-    script_path="$(realpath "$0")"
-    
-    # Determine service directory
-    if [[ -n "${PREFIX:-}" ]]; then
-        # Termux
-        service_dir="${PREFIX}/var/service/${service_name}"
-    elif [[ -d "/etc/sv" ]]; then
-        # Void Linux or similar
-        service_dir="/etc/sv/${service_name}"
-    else
-        service_dir="${SVDIR:-/var/service}/${service_name}"
-    fi
-    
-    # Idempotent: create directory if needed
-    mkdir -p "$service_dir"
-    
-    cat > "$service_dir/run" << RUNEOF
-#!/bin/sh
-set -e
-export HUB_HOST="${HUB_HOST}"
-export HUB_USER="${HUB_USER}"
-export REMOTE_SSH_PORT="${REMOTE_SSH_PORT}"
-export REMOTE_GATEWAY_PORT="${REMOTE_GATEWAY_PORT}"
-export LOCAL_SSH_PORT="${LOCAL_SSH_PORT}"
-export LOCAL_GATEWAY_PORT="${LOCAL_GATEWAY_PORT}"
-exec ${script_path}
-RUNEOF
+status() {
+  validate
+  say "Tunnel desired ports: SSH=${REMOTE_SSH_PORT}, GW=${REMOTE_GATEWAY_PORT}"
 
-    chmod +x "$service_dir/run"
-    
-    echo "Created/updated runit service: $service_dir"
-    echo ""
-    echo "To start: sv up ${service_name}"
-    echo "To check: sv status ${service_name}"
-    echo "To stop:  sv down ${service_name}"
+  if pgrep -f "ssh.*-R.*127\.0\.0\.1:${REMOTE_SSH_PORT}" >/dev/null 2>&1; then
+    say "OK: tunnel process appears running"
+  else
+    say "WARN: tunnel process not detected via pgrep"
+  fi
+
+  if ssh -o ConnectTimeout=5 -o BatchMode=yes "${HUB_USER}@${HUB_HOST}" "echo ok" >/dev/null 2>&1; then
+    say "OK: can connect to hub"
+  else
+    say "WARN: cannot connect to hub (auth or network)"
+  fi
 }
 
-check_status() {
-    echo "Checking tunnel status..."
-    echo ""
-    
-    # Check if tunnel process is running
-    if pgrep -f "ssh.*-R.*${REMOTE_SSH_PORT:-NOTSET}" > /dev/null 2>&1; then
-        echo "✅ Tunnel process appears to be running"
-    else
-        echo "❌ No tunnel process found"
-    fi
-    
-    # Check if we can reach the hub
-    if ssh -o ConnectTimeout=5 -o BatchMode=yes "${HUB_USER}@${HUB_HOST}" "echo ok" > /dev/null 2>&1; then
-        echo "✅ Can connect to hub"
-    else
-        echo "❌ Cannot connect to hub"
-    fi
-    
-    echo ""
-    echo "To verify tunnel is working from the hub, run:"
-    echo "  ssh ${HUB_USER}@${HUB_HOST} 'ss -lntp | grep -E \":(${REMOTE_SSH_PORT:-PORT}|${REMOTE_GATEWAY_PORT:-PORT})\"'"
-}
-
-show_help() {
-    cat << HELPEOF
-Usage: $0 [OPTIONS]
-
-Set up a reverse SSH tunnel to the Octocore Constellation Hub.
-
-Options:
-  --install-systemd  Install as a systemd user service (Linux)
-  --install-runit    Install as a runit service (Termux, Void)
-  --status           Check tunnel status
-  --help, -h         Show this help message
-
-Environment Variables (required):
-  REMOTE_SSH_PORT      Hub-side SSH tunnel port (from Constellation Bible)
-  REMOTE_GATEWAY_PORT  Hub-side gateway tunnel port (from Constellation Bible)
-
-Environment Variables (optional):
-  HUB_HOST             Hub hostname (default: bot.ericmilgram.com)
-  HUB_USER             Hub username (default: eric_octocore_ai)
-  LOCAL_SSH_PORT       Local SSH port (default: 22)
-  LOCAL_GATEWAY_PORT   Local gateway port (default: 18789)
-
-Port Assignments (from Constellation Bible):
-  Agent      SSH Port  Gateway Port
-  -----      --------  ------------
-  Envy       2222      18790
-  JARVIS     2223      28791
-  Deadpool   2224      18793
-
-Example:
-  # For Deadpool (Indy):
-  export REMOTE_SSH_PORT=2224
-  export REMOTE_GATEWAY_PORT=18793
-  $0
-
-  # Install as systemd service:
-  REMOTE_SSH_PORT=2224 REMOTE_GATEWAY_PORT=18793 $0 --install-systemd
-
-HELPEOF
-}
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-case "${1:-}" in
-    --install-systemd)
-        validate_config
-        install_systemd_service
-        ;;
-    --install-runit)
-        validate_config
-        install_runit_service
-        ;;
-    --status)
-        check_status
-        ;;
-    --help|-h)
-        show_help
-        ;;
-    *)
-        validate_config
-        start_tunnel
-        ;;
+case "$ACTION" in
+  install-systemd) install_systemd_user_service ;;
+  status) status ;;
+  run) start_tunnel_fg ;;
+  *) die "unknown action: $ACTION" ;;
 esac
