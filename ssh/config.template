@@ -1,0 +1,72 @@
+# Octocore Agent Constellation - SSH Config Template
+#
+# Copy relevant sections to your ~/.ssh/config
+# Replace <YOUR_USERNAME> with your actual username on each host
+#
+
+# ============================================================================
+# HUB (bot.ericmilgram.com)
+# ============================================================================
+
+Host bot bot.ericmilgram.com constellation-hub
+    HostName bot.ericmilgram.com
+    User eric_octocore_ai
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+
+# ============================================================================
+# SPOKES (via Hub reverse tunnels)
+# ============================================================================
+
+# Envy (Data's host) - via hub tunnel
+Host envy-via-hub
+    HostName 127.0.0.1
+    Port 2222
+    User eric
+    ProxyJump bot.ericmilgram.com
+    # Or without ProxyJump, from the hub directly:
+    # ssh -p 2222 eric@127.0.0.1
+
+# JARVIS (Android/Termux) - via hub tunnel  
+Host jarvis-via-hub
+    HostName 127.0.0.1
+    Port 2223
+    User u0_a527
+    ProxyJump bot.ericmilgram.com
+
+# Indy (Deadpool) - via hub tunnel
+# Port TBD - will be assigned when onboarded
+# Host deadpool-via-hub
+#     HostName 127.0.0.1
+#     Port 2224
+#     User indy
+#     ProxyJump bot.ericmilgram.com
+
+# ============================================================================
+# CANONICAL LOOPBACK PORTS (when local forwards are active)
+# ============================================================================
+#
+# If you run the canonical port forwarding script, these become available:
+#
+#   localhost:23190 -> Envy gateway
+#   localhost:23191 -> Hub gateway  
+#   localhost:23192 -> JARVIS gateway
+#   localhost:23222 -> Envy SSH
+#   localhost:23223 -> JARVIS SSH
+#
+# See: scripts/setup-canonical-ports.sh
+
+# ============================================================================
+# LOCAL NETWORK (when on same LAN)
+# ============================================================================
+
+# Envy direct (home LAN only)
+Host envy envy.lan
+    HostName envy.lan
+    User eric
+    
+# JARVIS direct (home LAN only)
+Host jarvis-lan
+    HostName Eric-s-S24-Ultra.lan
+    Port 8022
+    User u0_a527
